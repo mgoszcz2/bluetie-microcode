@@ -5,27 +5,31 @@
 {-# LANGUAGE TemplateHaskell #-}
 module Hardware.Microcode where
 
-import Data.Label
-import Data.Monoid
 import Control.Monad.Writer
 import Data.Enumerable.Generic
+import Data.List ((\\))
 import Data.Ord (comparing)
 import GHC.Generics (Generic)
+import Data.Label (mkLabel, set)
+import Control.Arrow ((***), first, second)
 import Data.List (mapAccumL, mapAccumR, sortBy)
 import qualified Data.ByteString as BS
 
-type Signals f s = Writer [[(f, s)]] () -- Accumulated ticks
-type Directive i = Writer (Endo i) () -- Acumulated microassembly
-type Bits = [(String, [Bit])] -- Serialised bits
-type States f i = (Int, f, i) -- Cpu state
-type Bit = Bool
+type Signals f s = Writer [[(f, s)]] ()
+type Directive i = Writer (Endo i) ()
+type Bits = [(String, [Bit])]
 
+data Bit = Low | High deriving (Show, Eq)
+data States f i = States Int f i deriving (Show)
 data AddressRange = Flags Int | State Int | Instruction Int deriving (Show)
-
 data RomConfig = RomConfig { romCount :: Int
                            , romAddressSize :: Int
                            , addressRange :: [AddressRange]
                            } deriving (Show)
+
+instance Enumerable Bit where
+    per Low = (High, False)
+    per High = (Low, True)
 
 class Signal s where
     nop :: s
@@ -76,22 +80,18 @@ nothing :: (Signal i) => Directive i
 nothing = cmd id
 
 -- | Turn a nested per tick/per flag strucure into a flat one
-flattenRom :: (Instruction i, Flags f, Signal s) => i -> [[(f, s)]] -> [(States f i, s)]
+flattenRom :: (Signal s, Flags f, Instruction i) => i -> [[(f, s)]] -> [(States f i, s)]
 flattenRom i = snd . foldl countTicks (0, [])
     where countTicks (ac, flat) perflag = (ac + 1, flat ++ map (makeTuple ac) perflag)
-          makeTuple ac (f, s) = ((ac, f, i), s)
+          makeTuple ac (f, s) = (States ac f i, s)
 
--- | Pad a nested raw states strucutre to correct number of states, if they are missing
-padStates :: (Flags f, Signal s) => Int -> [[(f, s)]] -> [[(f, s)]]
-padStates sts cnt = take sts $ cnt ++ repeat blank
-    where blank = map (\f -> (f, nop)) flags
-
+-- | Given a "bit map" and `States` produce a `Bits` structure
 stateBits :: (Instruction i, Flags f) => [AddressRange] -> States f i -> Bits
-stateBits ar (s, f, i) = concatMap truncated ar
-     where getBit (State a) = bitInt "state" a s
-           getBit (Flags _) = flagBits f
-           getBit (Instruction _) = instructonBits i
-           truncated x = bitsTruncate (fromRange x) (getBit x)
+stateBits ar (States s f i) = concatMap truncated ar
+    where truncated x = bitsTruncate (fromRange x) $ case x of
+                            State a -> bitInt "state" a s
+                            Flags _ -> flagBits f
+                            Instruction _ -> instructonBits i
 
 addressRangeSize :: [AddressRange] -> Int
 addressRangeSize = sum . map fromRange
@@ -107,17 +107,20 @@ bitsTruncate wide = snd . mapAccumR truncateAcc 0
     where truncateAcc a (d, b) = (a + length b, (d, take (wide - a) b))
 
 makeRom :: (Instruction i, Flags f, Signal s)
-        => RomConfig -> (i -> Signals f s) -> [i] -> [(Int, Int)]
-makeRom RomConfig{..} dsl ins
-    | apparentCount /= romAddressSize = error $ "Invalid bit counts: " ++ show apparentCount
-    | otherwise = bitsRom addressRange $ concatMap runDsl ins
-    where apparentCount = sum $ map fromAddressRange addressRange
-          runDsl i = flattenRom i . padStates (getStateCount addressRange) . execWriter $ dsl i
+        => RomConfig -> (i -> Signals f s) -> [i] -> [[Bit]]
+makeRom conf@RomConfig{..} dsl ins
+    | realCnt /= romAddressSize = error $ "Invalid bit counts: " ++ show realCnt
+    | otherwise = bitsRom conf $ concatMap runDsl ins
+    where runDsl i = flattenRom i . execWriter $ dsl i
+          realCnt = addressRangeSize addressRange
 
+-- | Turn all `States` and `Signal`s into sorted output values
 bitsRom :: (Instruction i, Flags f, Signal s)
-        => [AddressRange] -> [(States f i, s)] -> [(Int, Int)]
-bitsRom addrRng = sortWith fst . map genBits
-    where genBits (t, i) = (bitsToInt $ stateBits addrRng t, bitsToInt $ signalBits i)
+        => RomConfig -> [(States f i, s)] -> [[Bit]]
+bitsRom RomConfig{..} sts = map snd . sortWith fst $ bits ++ map ((`first` filler) . const) missingIns
+    where missingIns = [0..2 ^ addressRangeSize addressRange - 1] \\ (map fst bits)
+          bits = map (bitsToInt . stateBits addressRange *** concatMap snd . signalBits) sts
+          filler = (0, concatMap snd . signalBits $ nop `asTypeOf` (snd $ head sts))
 
 fromRange :: AddressRange -> Int
 fromRange (Flags i) = i
@@ -139,22 +142,20 @@ bit :: String -> Bit -> Bits
 bit doc pre = makeBits doc [pre]
 
 bit0, bit1 :: Bits
-bit0 = makeBits "Low" [False]
-bit1 = makeBits "High" [True]
+bit0 = makeBits "Low" [Low]
+bit1 = makeBits "High" [High]
 
 intToBit :: Int ->  [Bit]
 intToBit 0 = []
-intToBit n = (n `mod` 2 == 1) : intToBit (n `div` 2)
-
-boolInt :: Bool -> Int
-boolInt True = 1
-boolInt False = 0
+intToBit n = (if n `mod` 2 == 1 then High else Low) : intToBit (n `div` 2)
 
 bitToInt :: [Bit] -> Int
-bitToInt = sum . zipWith (*) (iterate (*2) 1) . map boolInt
+bitToInt = sum . zipWith (*) (iterate (*2) 1) . map biti
+    where biti Low = 0
+          biti High = 1
 
 bitInt :: String -> Int -> Int -> Bits
-bitInt doc bits num = makeBits doc . take bits $ intToBit num ++ repeat False
+bitInt doc bits num = makeBits doc . take bits $ intToBit num ++ repeat Low
 
 bitsToInt :: Bits -> Int
 bitsToInt = bitToInt . concatMap snd
@@ -165,6 +166,7 @@ data TieFlags = TieFlags { carry, equal, zero, sign, icarry, int :: Bit }
 
 data TieSignal = TieSignal { _writeReg :: Bit
                            , _halted :: Bit
+                           , _busOne :: Bit
                            } deriving (Show)
 
 data TieInstruction = Halt | Move | Add deriving (Eq, Show, Generic)
@@ -180,17 +182,17 @@ instance Flags TieFlags where
                             bit "interrupt" int
 instance Enumerable TieFlags
 instance Default TieFlags where
-    def = TieFlags False False False False False False
+    def = TieFlags Low Low Low Low Low Low
 instance Enumerable TieInstruction
 instance Instruction TieInstruction where
-    instructonBits Halt = makeBits "instruction" [False, False]
-    instructonBits Move = makeBits "instruction" [False, True]
-    instructonBits Add = makeBits "instruction" [True, False]
+    instructonBits Halt = makeBits "instruction" [Low, Low]
+    instructonBits Move = makeBits "instruction" [Low, High]
+    instructonBits Add = makeBits "instruction" [High, Low]
 instance Defaults TieInstruction where
     defs = [Halt, Move, Add]
 instance Signal TieSignal where
-    nop = TieSignal False False
-    signalBits TieSignal{..} = bit "writeReg" _writeReg ++ bit "halted" _halted
+    nop = TieSignal Low Low Low
+    signalBits TieSignal{..} = bit "writeReg" _writeReg ++ bit "halted" _halted ++ bit "busOne" _busOne
 
 showNested :: (Show a) => [[a]] -> String
 showNested = unlines . map (unlines . map show)
@@ -205,7 +207,7 @@ process Halt = do
     tick nothing
 process _ = tick nothing
 
-testMakeRom = makeRom sampleConf process allDefsEnum
+testMakeRom = makeRom sampleConf process defs
 
 sampleConf :: RomConfig
 sampleConf = RomConfig 1 10 [Flags 6, State 2, Instruction 2]

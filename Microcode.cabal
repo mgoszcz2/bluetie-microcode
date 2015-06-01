@@ -23,8 +23,7 @@ library
                        derive-enumerable ==0.1.*,
                        bytestring ==0.10.*,
                        mtl ==2.1.*,
-                       fclabels ==2.0.*,
-                       HList ==0.4.*
+                       fclabels ==2.0.*
   hs-source-dirs:      src
   ghc-options:           -Wall
   default-language:    Haskell2010
