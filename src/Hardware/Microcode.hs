@@ -12,7 +12,7 @@ module Hardware.Microcode (
     , bit1
     , bitInt
     , bit
-    -- ** `Signals` onstruction functions
+    -- ** `Signals` construction functions
     , nothing
     , tick
     , tickF
@@ -23,23 +23,14 @@ module Hardware.Microcode (
     -- * Types
     , Signals
     , Directive
+    , Bits
     , Bit(..)
-    , States(..)
     , AddressRange(..)
     , RomConfig(..)
     -- * Classes
-    -- ** Signal
-    , Signal
-    , nop
-    , signalBits
-    -- ** Flags
-    , Flags
-    , flags
-    , flagBits
-    -- ** Instruction
-    , Instruction
-    , instructions
-    , instructonBits
+    , Signal (nop, signalBits)
+    , Flags (flags, flagBits)
+    , Instruction (instructions, instructonBits)
     ) where
 
 import Data.Monoid
@@ -58,12 +49,15 @@ type Signals f s = Writer [[(f, s)]] ()
 type Directive s = Writer (Endo s) ()
 type Bits = [(String, [Bit])]
 
+-- | Eletronics equivalent of `Bool`
 data Bit = Low | High deriving (Show, Eq)
 data States f i = States Int f i deriving (Show)
+-- | Types of inputs of a ROM. Repeated enteries are allowed but kind of pointless
 data AddressRange = Flags Int | State Int | Instruction Int deriving (Show)
-data RomConfig = RomConfig { romCount :: Int
-                           , romAddressSize :: Int
-                           , addressRange :: [AddressRange]
+-- | Configuration data for `makeRom` functin
+data RomConfig = RomConfig { romCount :: Int -- ^ Amount of 8-bit ROM chips aveliable
+                           , romAddressSize :: Int -- ^ Number of input bits in each ROM.. Should add up to `addressRange`
+                           , addressRange :: [AddressRange] -- ^ Order of inputs into a ROM
                            } deriving (Show)
 
 instance Enumerable Bit where
@@ -71,21 +65,27 @@ instance Enumerable Bit where
     per High = (Low, True)
 
 class Signal s where
+    -- | Default value for a signal that does nothing
     nop :: s
     default nop :: (Default s) => s
     nop = def
+    -- | Serialize a signal into `Bits`
     signalBits :: s -> Bits
 
 class Flags f where
+    -- | Return all possible variations of flags
     flags :: [f]
     default flags :: (Default f, Enumerable f) => [f]
     flags = allEnum
+    -- | Serialize flag value into `Bits`
     flagBits :: f -> Bits
 
 class Instruction i where
+    -- | Assemble an instruction into `Bits`
     instructonBits :: i -> Bits
-    default instructions :: (Defaults i, Enumerable i) => [i]
+    -- | Returns all possible valid instructions
     instructions :: [i]
+    default instructions :: (Defaults i, Enumerable i) => [i]
     instructions = allDefsEnum
 
 -- | Dcoumentation helper function. Turn `Bits` into a string and range pairs
@@ -141,14 +141,16 @@ chunk r xs    = take r xs : chunk r (drop r xs)
 bitsExport :: [[Bit]] -> [Word8]
 bitsExport = map (fromIntegral . bitToInt)
 
--- | Simple checks and DSL execution. For book-keeping see `prepRomBits`
+-- | Simple checks and DSL execution
 makeRom :: (Instruction i, Flags f, Signal s)
         => RomConfig -> (i -> Signals f s) -> [[Word8]]
 makeRom conf@RomConfig{..} dsl
     | realCnt /= romAddressSize = error $ "Invalid bit counts: " ++ show realCnt
-    | otherwise = map bitsExport . prepRomBits conf $ concatMap runDsl instructions
+    | length rom /= romCount = error $ "Rom count mismatch: " ++ show (length rom)
+    | otherwise = rom
     where runDsl i = flattenRom i . execWriter $ dsl i
           realCnt = addressRangeSize addressRange
+          rom = map bitsExport . prepRomBits conf $ concatMap runDsl instructions
 
 -- | Turn all `States` and `Signal`s into sorted output values
 -- Splits outputs into 8-bit chunks, fills in any missing gaps with `nop`s
@@ -185,7 +187,7 @@ intToBit :: Int ->  [Bit]
 intToBit 0 = []
 intToBit n = (if n `mod` 2 == 1 then High else Low) : intToBit (n `div` 2)
 
--- | Opposite of `intToBit`
+-- | Turns binary `Bit`s into an `Int`
 bitToInt :: [Bit] -> Int
 bitToInt = sum . zipWith (*) (iterate (*2) 1) . map biti
     where biti Low = 0
