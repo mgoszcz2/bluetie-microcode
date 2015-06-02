@@ -21,14 +21,12 @@ extra-source-files:  README.md
 library
   exposed-modules:     Hardware.Microcode
   other-extensions:    RecordWildCards,
-                       DefaultSignatures,
-                       TemplateHaskell 
+                       DefaultSignatures
   build-depends:       base ==4.7.*,
                        derive-enumerable ==0.1.*,
                        bytestring ==0.10.*,
                        mtl ==2.1.*,
-                       fclabels ==2.0.*,
-                       is >=0.2
+                       fclabels ==2.0.*
   hs-source-dirs:      src
   ghc-options:         -Wall
   default-language:    Haskell2010

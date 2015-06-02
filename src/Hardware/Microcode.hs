@@ -1,15 +1,50 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE DefaultSignatures #-}
-{-# LANGUAGE TemplateHaskell #-}
-module Hardware.Microcode where
-
--- TODO: Doument more function
--- TODO: Selective exports
+module Hardware.Microcode (
+    -- * Modules
+    module Data.Enumerable.Generic
+    -- * Common functions
+    , makeRom
+    , exportAsFile
+    , exportAsLogisim
+    -- ** `Bits` construction
+    , bit0
+    , bit1
+    , bitInt
+    , bit
+    -- ** `Signals` onstruction functions
+    , nothing
+    , tick
+    , tickF
+    -- ** Other functions
+    , makeBits
+    , bitDocument
+    , cmd
+    -- * Types
+    , Signals
+    , Directive
+    , Bit(..)
+    , States(..)
+    , AddressRange(..)
+    , RomConfig(..)
+    -- * Classes
+    -- ** Signal
+    , Signal
+    , nop
+    , signalBits
+    -- ** Flags
+    , Flags
+    , flags
+    , flagBits
+    -- ** Instruction
+    , Instruction
+    , instructions
+    , instructonBits
+    ) where
 
 import Data.Monoid
 import Data.Enumerable.Generic
 import Data.Word (Word8)
-import Data.Generics.Is (makePredicates)
 import Text.Printf (printf)
 import Numeric (showHex)
 import Data.Ord (comparing)
@@ -20,6 +55,7 @@ import qualified Data.ByteString as BS
 
 -- Harmful do notation strikes again.. but it looks nicer
 type Signals f s = Writer [[(f, s)]] ()
+type Directive s = Writer (Endo s) ()
 type Bits = [(String, [Bit])]
 
 data Bit = Low | High deriving (Show, Eq)
@@ -29,8 +65,6 @@ data RomConfig = RomConfig { romCount :: Int
                            , romAddressSize :: Int
                            , addressRange :: [AddressRange]
                            } deriving (Show)
-
-makePredicates ''AddressRange
 
 instance Enumerable Bit where
     per Low = (High, False)
@@ -54,30 +88,28 @@ class Instruction i where
     instructions :: [i]
     instructions = allDefsEnum
 
--- | Given an `AddressRange` extract the length `Int`
-fromAddressRange :: AddressRange -> Int
-fromAddressRange (Flags a) = a
-fromAddressRange (State a) = a
-fromAddressRange (Instruction a) = a
-
 -- | Dcoumentation helper function. Turn `Bits` into a string and range pairs
 bitDocument :: Bits -> [(String, (Int, Int))]
 bitDocument = snd . mapAccumL makeDoc 0
     where makeDoc a (doc, bs) = let na = a + length bs
                                 in (na, (doc, (a, na)))
 
+-- | Run the `Endo` and `Writer` using the `nop` instruction for inital value
+makeDirective :: (Signal i) => Directive i -> i
+makeDirective c = (appEndo $ execWriter c) nop
+
 -- | Tick, calling a `Directive` function with current flags
-tickF :: (Signal i, Flags f) => (f -> Endo i) -> Signals f i
+tickF :: (Signal i, Flags f) => (f -> Directive i) -> Signals f i
 tickF fn = tell . return $ map pair flags
-    where pair f = (f, fn f `appEndo` nop)
+    where pair f = (f, makeDirective $ fn f)
 
 -- | Just tick, no conditionals
-tick :: (Signal i, Flags f) => Endo i -> Signals f i
-tick = tell . return . zip flags . repeat . (`appEndo` nop)
+tick :: (Signal i, Flags f) => Directive i -> Signals f i
+tick = tell . return . zip flags . repeat . makeDirective
 
 -- | Simplest `Directive`. Makes no modfications to the signals
-nothing :: (Signal i) => Endo i
-nothing = mempty
+nothing :: (Signal s) => Directive s
+nothing = cmd id
 
 -- | Turn a nested per tick/per flag strucure into a flat one
 flattenRom :: (Signal s, Flags f, Instruction i) => i -> [[(f, s)]] -> [(States f i, s)]
@@ -95,10 +127,6 @@ stateBits ar (States s f i) = concatMap truncated ar
 -- How many bits are needs for all input data
 addressRangeSize :: [AddressRange] -> Int
 addressRangeSize = sum . map fromRange
-
--- Total number of bits in `Bits`.. Not as simple as it sounds
-bitsLength :: Bits -> Int
-bitsLength = foldr ((+) . length . snd) 0
 
 -- `GHC.Exts`'s `sortWith` but using standard Haskell
 sortWith :: (Ord b) => (a -> b) -> [a] -> [a]
@@ -139,37 +167,41 @@ fromRange (Flags i) = i
 fromRange (State i) = i
 fromRange (Instruction i) = i
 
--- | Simply extract `State` from `AddressRange`s and calculate as power of 2
-getStateCount :: [AddressRange] -> Int
-getStateCount = (2 ^) . fromRange . head . filter isState -- This is supposed to be bad
-
-lastN :: Int -> [a] -> [a]
-lastN n xs = foldl (const . drop 1) xs $ drop n xs
-
+-- | Fancy way of putting things in a single list.. but more abstract and compatible
 makeBits :: String -> [Bit] -> Bits
 makeBits doc ds = return (doc, ds)
 
+-- | Helper for simply returning `Bit`s
 bit :: String -> Bit -> Bits
 bit doc pre = makeBits doc [pre]
 
+-- | Helpers for bit constants
 bit0, bit1 :: Bits
-bit0 = makeBits "Low" [Low]
-bit1 = makeBits "High" [High]
+bit0 = makeBits "low" [Low]
+bit1 = makeBits "high" [High]
 
+-- | Turn an `Int` into a series of `Bit`s
 intToBit :: Int ->  [Bit]
 intToBit 0 = []
 intToBit n = (if n `mod` 2 == 1 then High else Low) : intToBit (n `div` 2)
 
+-- | Opposite of `intToBit`
 bitToInt :: [Bit] -> Int
 bitToInt = sum . zipWith (*) (iterate (*2) 1) . map biti
     where biti Low = 0
           biti High = 1
 
+-- | Helper for creating `Bits` for `Int`s, doc followed by bits to take
 bitInt :: String -> Int -> Int -> Bits
 bitInt doc bits num = makeBits doc . take bits $ intToBit num ++ repeat Low
 
+-- | Turns a `Bits` structure into an `Int`
 bitsToInt :: Bits -> Int
 bitsToInt = bitToInt . concatMap snd
+
+-- | DSL command creating helper
+cmd :: (Signal i) => (i -> i) -> Directive i
+cmd = tell . Endo
 
 -- | Helper function that helps with writing other export helpers
 exportHelper :: (String -> [Word8] -> IO ()) -> String -> [[Word8]] -> IO ()
