@@ -5,14 +5,18 @@
 {-# LANGUAGE TemplateHaskell #-}
 module Hardware.Microcode where
 
+import Data.Word
+import Data.Generics.Is
 import Control.Monad.Writer
 import Data.Enumerable.Generic
-import Data.List ((\\))
+import Text.Printf (printf)
+import Numeric (showHex)
+import Data.List ((\\), transpose)
 import Data.Ord (comparing)
 import GHC.Generics (Generic)
 import Data.Label (mkLabel, set)
-import Control.Arrow ((***), first, second)
-import Data.List (mapAccumL, mapAccumR, sortBy)
+import Control.Arrow ((***), first)
+import Data.List (mapAccumL, sortBy)
 import qualified Data.ByteString as BS
 
 type Signals f s = Writer [[(f, s)]] ()
@@ -26,6 +30,8 @@ data RomConfig = RomConfig { romCount :: Int
                            , romAddressSize :: Int
                            , addressRange :: [AddressRange]
                            } deriving (Show)
+
+$(makePredicates ''AddressRange)
 
 instance Enumerable Bit where
     per Low = (High, False)
@@ -45,6 +51,9 @@ class Flags f where
 
 class Instruction i where
     instructonBits :: i -> Bits
+    default instructions :: (Defaults i, Enumerable i) => [i]
+    instructions :: [i]
+    instructions = allDefsEnum
 
 -- | Given an `AddressRange` extract the length `Int`
 fromAddressRange :: AddressRange -> Int
@@ -88,49 +97,60 @@ flattenRom i = snd . foldl countTicks (0, [])
 -- | Given a "bit map" and `States` produce a `Bits` structure
 stateBits :: (Instruction i, Flags f) => [AddressRange] -> States f i -> Bits
 stateBits ar (States s f i) = concatMap truncated ar
-    where truncated x = bitsTruncate (fromRange x) $ case x of
-                            State a -> bitInt "state" a s
-                            Flags _ -> flagBits f
-                            Instruction _ -> instructonBits i
+    where truncated (State a) = bitInt "state" a s
+          truncated (Flags _) = flagBits f
+          truncated (Instruction _) = instructonBits i
 
+-- How many bits are needs for all input data
 addressRangeSize :: [AddressRange] -> Int
 addressRangeSize = sum . map fromRange
 
+-- Total number of bits in `Bits`.. Not as simple as it sounds
 bitsLength :: Bits -> Int
 bitsLength = foldr ((+) . length . snd) 0
 
+-- `GHC.Exts`'s `sortWith` but using standard Haskell
 sortWith :: (Ord b) => (a -> b) -> [a] -> [a]
 sortWith = sortBy . comparing
 
-bitsTruncate :: Int -> Bits -> Bits
-bitsTruncate wide = snd . mapAccumR truncateAcc 0
-    where truncateAcc a (d, b) = (a + length b, (d, take (wide - a) b))
+-- | Split a list so that a sub-list is never longer than N
+chunk :: Int -> [a] -> [[a]]
+chunk _ []    = []
+chunk r xs    = take r xs : chunk r (drop r xs)
 
+-- | Finnal step, turn `Bit` lists into `Word8`
+bitsExport :: [[Bit]] -> [Word8]
+bitsExport = map (fromIntegral . bitToInt)
+
+-- | Simple checks and DSL execution. For book-keeping see `prepRomBits`
 makeRom :: (Instruction i, Flags f, Signal s)
-        => RomConfig -> (i -> Signals f s) -> [i] -> [[Bit]]
-makeRom conf@RomConfig{..} dsl ins
+        => RomConfig -> (i -> Signals f s) -> [[Word8]]
+makeRom conf@RomConfig{..} dsl
     | realCnt /= romAddressSize = error $ "Invalid bit counts: " ++ show realCnt
-    | otherwise = bitsRom conf $ concatMap runDsl ins
+    | otherwise = map bitsExport . prepRomBits conf $ concatMap runDsl instructions
     where runDsl i = flattenRom i . execWriter $ dsl i
           realCnt = addressRangeSize addressRange
 
 -- | Turn all `States` and `Signal`s into sorted output values
-bitsRom :: (Instruction i, Flags f, Signal s)
-        => RomConfig -> [(States f i, s)] -> [[Bit]]
-bitsRom RomConfig{..} sts = map snd . sortWith fst $ bits ++ map ((`first` filler) . const) missingIns
+-- Splits outputs into 8-bit chunks, fills in any missing gaps with `nop`s
+-- And discrads input data by sorting. In short: General book-keeping
+prepRomBits :: (Instruction i, Flags f, Signal s)
+            => RomConfig -> [(States f i, s)] -> [[[Bit]]]
+prepRomBits RomConfig{..} sts = transpose $ map (chunk 8 . snd) newSts
     where missingIns = [0..2 ^ addressRangeSize addressRange - 1] \\ (map fst bits)
           bits = map (bitsToInt . stateBits addressRange *** concatMap snd . signalBits) sts
-          filler = (0, concatMap snd . signalBits $ nop `asTypeOf` (snd $ head sts))
+          filler = (0 :: Int, concatMap snd . signalBits $ nop `asTypeOf` (snd $ head sts))
+          newSts = sortWith fst $ bits ++ map ((`first` filler) . const) missingIns
 
+-- | All `AddressRange` contain an `Int` signifing the size in bits. Extract it
 fromRange :: AddressRange -> Int
 fromRange (Flags i) = i
 fromRange (State i) = i
 fromRange (Instruction i) = i
 
+-- | Simply extract `State` from `AddressRange`s and calculate as power of 2
 getStateCount :: [AddressRange] -> Int
-getStateCount = (2 ^) . fromRange . head . filter scnt -- This is supposed to be bad
-    where scnt (State _) = True
-          scnt _         = False
+getStateCount = (2 ^) . fromRange . head . filter isState -- This is supposed to be bad
 
 lastN :: Int -> [a] -> [a]
 lastN n xs = foldl (const . drop 1) xs $ drop n xs
@@ -160,6 +180,23 @@ bitInt doc bits num = makeBits doc . take bits $ intToBit num ++ repeat Low
 bitsToInt :: Bits -> Int
 bitsToInt = bitToInt . concatMap snd
 
+-- | Helper function that helps with writing other export helpers
+exportHelper :: (String -> [Word8] -> IO ()) -> String -> [[Word8]] -> IO ()
+exportHelper io filen rom = mapM_ wrapIo $ zip ([0..] :: [Int]) rom
+    where wrapIo (ix, bs) = do let fullname = show ix ++ filen
+                               io fullname bs
+                               printf "Wrote ROM #%d to file '%s'\n" ix fullname
+
+-- | Helper to export the `makeRom` output into binary file(s)
+exportAsFile :: String -> [[Word8]] -> IO ()
+exportAsFile = exportHelper (\n d -> BS.writeFile n $ BS.pack d)
+
+-- | Helper to export `makeRom` output into Logisim format
+exportAsLogisim :: String -> [[Word8]] -> IO ()
+exportAsLogisim = exportHelper write
+    where write filen xs = writeFile filen . unlines $ "v2.0 raw" : map (flip showHex "") xs
+                              
+
 -- THE UGLY PARTS FOR TESTING --
 data TieFlags = TieFlags { carry, equal, zero, sign, icarry, int :: Bit }
                          deriving (Show, Generic)
@@ -167,6 +204,12 @@ data TieFlags = TieFlags { carry, equal, zero, sign, icarry, int :: Bit }
 data TieSignal = TieSignal { _writeReg :: Bit
                            , _halted :: Bit
                            , _busOne :: Bit
+                           , _busTwo :: Bit
+                           , _butThree :: Bit
+                           , _busFour :: Bit
+                           , _rstState :: Bit
+                           , _rstFlags :: Bit
+                           , _wrtFlags :: Bit
                            } deriving (Show)
 
 data TieInstruction = Halt | Move | Add deriving (Eq, Show, Generic)
@@ -180,19 +223,27 @@ instance Flags TieFlags where
                             bit "sign" sign ++
                             bit "icarry" icarry ++
                             bit "interrupt" int
-instance Enumerable TieFlags
 instance Default TieFlags where
     def = TieFlags Low Low Low Low Low Low
-instance Enumerable TieInstruction
+instance Enumerable TieFlags
 instance Instruction TieInstruction where
     instructonBits Halt = makeBits "instruction" [Low, Low]
     instructonBits Move = makeBits "instruction" [Low, High]
     instructonBits Add = makeBits "instruction" [High, Low]
 instance Defaults TieInstruction where
     defs = [Halt, Move, Add]
+instance Enumerable TieInstruction
 instance Signal TieSignal where
-    nop = TieSignal Low Low Low
-    signalBits TieSignal{..} = bit "writeReg" _writeReg ++ bit "halted" _halted ++ bit "busOne" _busOne
+    nop = TieSignal Low Low Low Low Low Low Low Low Low
+    signalBits TieSignal{..} = bit "writeReg" _writeReg ++
+                               bit "halted" _halted ++
+                               bit "busOne" _busOne ++
+                               bit "busTwo" _busTwo ++
+                               bit "butThree" _butThree ++
+                               bit "busFour" _busFour ++
+                               bit "rstState" _rstState ++
+                               bit "rstFlags" _rstFlags ++
+                               bit "wrtFlags" _wrtFlags
 
 showNested :: (Show a) => [[a]] -> String
 showNested = unlines . map (unlines . map show)
@@ -207,7 +258,5 @@ process Halt = do
     tick nothing
 process _ = tick nothing
 
-testMakeRom = makeRom sampleConf process defs
-
 sampleConf :: RomConfig
-sampleConf = RomConfig 1 10 [Flags 6, State 2, Instruction 2]
+sampleConf = RomConfig 2 10 [Flags 6, State 2, Instruction 2]
