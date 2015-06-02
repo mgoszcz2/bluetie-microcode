@@ -5,22 +5,22 @@
 {-# LANGUAGE TemplateHaskell #-}
 module Hardware.Microcode where
 
-import Data.Word
-import Data.Generics.Is
-import Control.Monad.Writer
+import Data.Monoid
 import Data.Enumerable.Generic
+import Data.Word (Word8)
+import Data.Generics.Is (makePredicates)
 import Text.Printf (printf)
 import Numeric (showHex)
-import Data.List ((\\), transpose)
 import Data.Ord (comparing)
 import GHC.Generics (Generic)
 import Data.Label (mkLabel, set)
 import Control.Arrow ((***), first)
-import Data.List (mapAccumL, sortBy)
+import Data.List (mapAccumL, sortBy, transpose, (\\))
+import Control.Monad.Writer (execWriter, tell, Writer)
 import qualified Data.ByteString as BS
 
+-- Harmful do notation strikes again.. but it looks nicer
 type Signals f s = Writer [[(f, s)]] ()
-type Directive i = Writer (Endo i) ()
 type Bits = [(String, [Bit])]
 
 data Bit = Low | High deriving (Show, Eq)
@@ -68,25 +68,17 @@ bitDocument = snd . mapAccumL makeDoc 0
                                 in (na, (doc, (a, na)))
 
 -- | Tick, calling a `Directive` function with current flags
-tickF :: (Signal i, Flags f) => (f -> Directive i) -> Signals f i
+tickF :: (Signal i, Flags f) => (f -> Endo i) -> Signals f i
 tickF fn = tell . return $ map pair flags
-    where pair f = (f, makeDirective $ fn f)
+    where pair f = (f, fn f `appEndo` nop)
 
 -- | Just tick, no conditionals
-tick :: (Signal i, Flags f) => Directive i -> Signals f i
-tick = tell . return . zip flags . repeat . makeDirective
-
--- | Run the `Endo` and `Writer` using the `nop` instruction for inital value
-makeDirective :: (Signal i) => Directive i -> i
-makeDirective c = (appEndo $ execWriter c) nop
-
--- | Quick sugar for writing `Directive` commands
-cmd :: (Signal i) => (i -> i) -> Directive i
-cmd = tell . Endo
+tick :: (Signal i, Flags f) => Endo i -> Signals f i
+tick = tell . return . zip flags . repeat . (`appEndo` nop)
 
 -- | Simplest `Directive`. Makes no modfications to the signals
-nothing :: (Signal i) => Directive i
-nothing = cmd id
+nothing :: (Signal i) => Endo i
+nothing = mempty
 
 -- | Turn a nested per tick/per flag strucure into a flat one
 flattenRom :: (Signal s, Flags f, Instruction i) => i -> [[(f, s)]] -> [(States f i, s)]
@@ -139,7 +131,7 @@ prepRomBits :: (Instruction i, Flags f, Signal s)
 prepRomBits RomConfig{..} sts = transpose $ map (chunk 8 . snd) newSts
     where missingIns = [0..2 ^ addressRangeSize addressRange - 1] \\ (map fst bits)
           bits = map (bitsToInt . stateBits addressRange *** concatMap snd . signalBits) sts
-          filler = (0 :: Int, concatMap snd . signalBits $ nop `asTypeOf` (snd $ head sts))
+          filler = (0 :: Int, concatMap snd . signalBits $ nop `asTypeOf` (snd $ head sts)) -- Uh.. Oh
           newSts = sortWith fst $ bits ++ map ((`first` filler) . const) missingIns
 
 -- | All `AddressRange` contain an `Int` signifing the size in bits. Extract it
@@ -248,13 +240,12 @@ instance Signal TieSignal where
 showNested :: (Show a) => [[a]] -> String
 showNested = unlines . map (unlines . map show)
 
-regWrite :: Bit -> Directive TieSignal
-regWrite d = cmd $ set writeReg d
+regWrite :: Bit -> Endo TieSignal
+regWrite d = Endo $ set writeReg d
 
 process :: TieInstruction -> Signals TieFlags TieSignal
 process Halt = do
-    tickF $ \TieFlags{carry} -> do nothing
-                                   regWrite carry
+    tickF $ \TieFlags{carry} -> nothing <> regWrite carry
     tick nothing
 process _ = tick nothing
 
