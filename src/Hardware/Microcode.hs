@@ -1,9 +1,10 @@
-{-# LANGUAGE DeriveGeneric #-} -- REMOVE
-{-# LANGUAGE NamedFieldPuns #-} -- REMOVE
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE DefaultSignatures #-}
 {-# LANGUAGE TemplateHaskell #-}
 module Hardware.Microcode where
+
+-- TODO: Doument more function
+-- TODO: Selective exports
 
 import Data.Monoid
 import Data.Enumerable.Generic
@@ -29,7 +30,7 @@ data RomConfig = RomConfig { romCount :: Int
                            , addressRange :: [AddressRange]
                            } deriving (Show)
 
-$(makePredicates ''AddressRange)
+makePredicates ''AddressRange
 
 instance Enumerable Bit where
     per Low = (High, False)
