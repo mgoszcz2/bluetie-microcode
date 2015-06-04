@@ -20,6 +20,8 @@ module Hardware.Microcode (
     , makeBits
     , bitDocument
     , cmd
+    , intToBit
+    , bitToInt
     -- * Types
     , Signals
     , Directive
@@ -40,9 +42,10 @@ import Text.Printf (printf)
 import Numeric (showHex)
 import Data.Ord (comparing)
 import Control.Arrow ((***), first)
-import Data.List (mapAccumL, sortBy, transpose, (\\))
+import Data.List (mapAccumL, transpose)
 import Control.Monad.Writer (execWriter, tell, Writer)
 import qualified Data.ByteString as BS
+import qualified Data.List.Ordered as OL
 
 -- Harmful do notation strikes again.. but it looks nicer
 type Signals f s = Writer [[(f, s)]] ()
@@ -130,7 +133,7 @@ addressRangeSize = sum . map fromRange
 
 -- `GHC.Exts`'s `sortWith` but using standard Haskell
 sortWith :: (Ord b) => (a -> b) -> [a] -> [a]
-sortWith = sortBy . comparing
+sortWith = OL.sortBy . comparing
 
 -- | Split a list so that a sub-list is never longer than N
 chunk :: Int -> [a] -> [[a]]
@@ -155,11 +158,12 @@ makeRom conf@RomConfig{..} dsl
 -- | Turn all `States` and `Signal`s into sorted output values
 -- Splits outputs into 8-bit chunks, fills in any missing gaps with `nop`s
 -- And discrads input data by sorting. In short: General book-keeping
+-- Right now it's ugly.. but before it was slow, so a good trade off
 prepRomBits :: (Instruction i, Flags f, Signal s)
             => RomConfig -> [(States f i, s)] -> [[[Bit]]]
 prepRomBits RomConfig{..} sts = transpose $ map (chunk 8 . snd) newSts
-    where missingIns = [0..2 ^ addressRangeSize addressRange - 1] \\ (map fst bits)
-          bits = map (bitsToInt . stateBits addressRange *** concatMap snd . signalBits) sts
+    where missingIns = OL.minus [0..2 ^ addressRangeSize addressRange - 1] $ (map fst bits)
+          bits = sortWith fst $ map (bitsToInt . stateBits addressRange *** concatMap snd . signalBits) sts
           filler = (0 :: Int, concatMap snd . signalBits $ nop `asTypeOf` (snd $ head sts)) -- Uh.. Oh
           newSts = sortWith fst $ bits ++ map ((`first` filler) . const) missingIns
 
