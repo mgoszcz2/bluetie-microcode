@@ -18,10 +18,13 @@ module Hardware.Microcode (
     , tickF
     -- ** Other functions
     , makeBits
+    , padBits
     , bitDocument
     , cmd
+    , chg
     , intToBit
     , bitToInt
+    , bitsLength
     -- * Types
     , Signals
     , Directive
@@ -32,7 +35,7 @@ module Hardware.Microcode (
     -- * Classes
     , Signal (nop, signalBits)
     , Flags (flags, flagBits)
-    , Instruction (instructions, instructonBits)
+    , Instruction (instructions, instructionBits)
     ) where
 
 import Data.Monoid
@@ -56,7 +59,7 @@ type Bits = [(String, [Bit])]
 data Bit = Low | High deriving (Show, Eq)
 data States f i = States Int f i deriving (Show)
 -- | Types of inputs of a ROM. Repeated enteries are allowed but kind of pointless
-data AddressRange = Flags Int | State Int | Instruction Int deriving (Show)
+data AddressRange = Flags Int | State Int | Instruction Int | Blank Int deriving (Show)
 -- | Configuration data for `makeRom` functin
 data RomConfig = RomConfig { romCount :: Int -- ^ Amount of 8-bit ROM chips aveliable
                            , romAddressSize :: Int -- ^ Number of input bits in each ROM.. Should add up to `addressRange`
@@ -67,7 +70,7 @@ instance Enumerable Bit where
     per Low = (High, False)
     per High = (Low, True)
 
-class Signal s where
+class Show s => Signal s where
     -- | Default value for a signal that does nothing
     nop :: s
     default nop :: (Default s) => s
@@ -75,7 +78,7 @@ class Signal s where
     -- | Serialize a signal into `Bits`
     signalBits :: s -> Bits
 
-class Flags f where
+class Show f => Flags f where
     -- | Return all possible variations of flags
     flags :: [f]
     default flags :: (Default f, Enumerable f) => [f]
@@ -83,9 +86,9 @@ class Flags f where
     -- | Serialize flag value into `Bits`
     flagBits :: f -> Bits
 
-class Instruction i where
+class Show i => Instruction i where
     -- | Assemble an instruction into `Bits`
-    instructonBits :: i -> Bits
+    instructionBits :: i -> Bits
     -- | Returns all possible valid instructions
     instructions :: [i]
     default instructions :: (Defaults i, Enumerable i) => [i]
@@ -120,12 +123,24 @@ flattenRom i = snd . foldl countTicks (0, [])
     where countTicks (ac, flat) perflag = (ac + 1, flat ++ map (makeTuple ac) perflag)
           makeTuple ac (f, s) = (States ac f i, s)
 
+-- | Get the number of bits in `Bits` (not as simple as it sounds)
+bitsLength :: Bits -> Int
+bitsLength = sum . map (length . snd)
+
+-- | Make sure the specification matches what the serialization function returned
+-- or fail gracefully
+guardBits :: (Instruction i, Flags f) => States f i -> AddressRange -> Bits -> Bits
+guardBits s r b = if fromRange r == bl then b else error msg
+    where msg = printf "Bit length %s doesn't match (%s) [%s]" (show bl) (show r) (show s)
+          bl = bitsLength b
+
 -- | Given a "bit map" and `States` produce a `Bits` structure
 stateBits :: (Instruction i, Flags f) => [AddressRange] -> States f i -> Bits
-stateBits ar (States s f i) = concatMap truncated ar
-    where truncated (State a) = bitInt "state" a s
-          truncated (Flags _) = flagBits f
-          truncated (Instruction _) = instructonBits i
+stateBits ar y@(States s f i) = concatMap get ar
+    where get (State n) = bitInt "state" n s
+          get (Blank n) = makeBits "blank" $ replicate n Low
+          get (Flags n) = guardBits y (Flags n) $ flagBits f
+          get (Instruction n) = guardBits y (Instruction n) $ instructionBits i
 
 -- How many bits are needs for all input data
 addressRangeSize :: [AddressRange] -> Int
@@ -162,7 +177,7 @@ makeRom conf@RomConfig{..} dsl
 prepRomBits :: (Instruction i, Flags f, Signal s)
             => RomConfig -> [(States f i, s)] -> [[[Bit]]]
 prepRomBits RomConfig{..} sts = transpose $ map (chunk 8 . snd) newSts
-    where missingIns = OL.minus [0..2 ^ addressRangeSize addressRange - 1] $ (map fst bits)
+    where missingIns = OL.isect [0..2 ^ addressRangeSize addressRange - 1] $ map fst bits
           bits = sortWith fst $ map (bitsToInt . stateBits addressRange *** concatMap snd . signalBits) sts
           filler = (0 :: Int, concatMap snd . signalBits $ nop `asTypeOf` (snd $ head sts)) -- Uh.. Oh
           newSts = sortWith fst $ bits ++ map ((`first` filler) . const) missingIns
@@ -172,10 +187,15 @@ fromRange :: AddressRange -> Int
 fromRange (Flags i) = i
 fromRange (State i) = i
 fromRange (Instruction i) = i
+fromRange (Blank i) = i
 
 -- | Fancy way of putting things in a single list.. but more abstract and compatible
 makeBits :: String -> [Bit] -> Bits
 makeBits doc ds = return (doc, ds)
+
+-- | Like `makeBits` but automatically pad to a given amounts of bits
+padBits :: Int -> String -> [Bit] -> Bits
+padBits pad doc ds = makeBits doc . take pad $ ds ++ repeat Low
 
 -- | Helper for simply returning `Bit`s
 bit :: String -> Bit -> Bits
@@ -204,6 +224,10 @@ bitInt doc bits num = makeBits doc . take bits $ intToBit num ++ repeat Low
 -- | Turns a `Bits` structure into an `Int`
 bitsToInt :: Bits -> Int
 bitsToInt = bitToInt . concatMap snd
+
+-- | Define a tick and a command at the same time `tick . cmd`
+chg :: (Flags f, Signal i) => (i -> i) -> Signals f i
+chg = tick . cmd
 
 -- | DSL command creating helper
 cmd :: (Signal i) => (i -> i) -> Directive i
